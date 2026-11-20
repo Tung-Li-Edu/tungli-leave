@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>東立文理｜請假</title>
-<!-- 東立文理 請假頁（LIFF）v1120-3：放在 GitHub Pages，資料由聯絡本網頁的 Apps Script 處理 -->
+<!-- 東立文理 請假頁（LIFF）v1120-4：放在 GitHub Pages，資料由聯絡本網頁的 Apps Script 處理 -->
 <script charset="utf-8" src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
 <style>
   :root{
@@ -36,6 +36,7 @@
   .row .t small{display:block;color:var(--muted);font-size:13px}
   .cancel{border:1.5px solid var(--danger);color:var(--danger);background:#fff;border-radius:10px;padding:7px 12px;font:inherit;font-size:14px;font-weight:600;flex:none}
   .cancel.sure{background:var(--danger);color:#fff}
+  .cancel:disabled{opacity:.45}
   .empty{color:var(--muted);font-size:15px;padding:4px 0}
   .msg{border-radius:12px;padding:12px 14px;margin-bottom:14px;white-space:pre-line;font-size:15px}
   .msg.ok{background:var(--ok-soft);color:var(--ok)}
@@ -62,6 +63,7 @@
 
     <div class="card">
       <p class="label">要請假的課（可以勾好幾堂）</p>
+      <p class="hint" id="stale" hidden style="margin:0 2px 8px">⏳ 先顯示上次的資料，正在更新…</p>
       <div id="opts"></div>
     </div>
 
@@ -87,9 +89,19 @@ const LIFF_ID = '2012709824-cIRR8hL2';
 const API_URL = 'https://script.google.com/macros/s/AKfycbyHgCnRvwft__Olyk1zZXyTolDM9Pa7HKZDv2iWfxBnRvsSW3qtixycq4490JXHD1Fo/exec';
 /* ======================== */
 
+// 一打開就先叫醒後台（Apps Script 第一次被叫要暖機），跟 LINE 登入同時進行（v1120-4）
+try { fetch(API_URL, { method: 'POST', body: '{"liff":"ping"}' }).catch(() => {}); } catch (e) {}
+
 const $ = s => document.querySelector(s);
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-let KIDS = [], busy = false;
+let KIDS = [], busy = false, fresh = false;
+
+// 手機記住上次的課表：下次打開先顯示，等後台回來再換成最新的（只存在這支手機上）
+const CK = 'tungli-leave:' + LIFF_ID;
+function cacheGet() { try { return JSON.parse(localStorage.getItem(CK) || 'null'); } catch (e) { return null; } }
+function cacheSet(uid, kids) { try { localStorage.setItem(CK, JSON.stringify({ uid, kids, at: Date.now() })); } catch (e) {} }
+function cacheDrop() { try { localStorage.removeItem(CK); } catch (e) {} }
+function myUid() { try { return (liff.getDecodedIDToken() || {}).sub || ''; } catch (e) { return ''; } }
 
 function showMsg(text, ok) {
   const m = $('#msg');
@@ -107,22 +119,33 @@ async function api(action, extra) {
 
 function kidNow() { return KIDS.find(k => k.name === $('#kid').value) || KIDS[0]; }
 
+// 換一份孩子清單（保留目前選的孩子）
+function setKids(list) {
+  const cur = $('#kid').value;
+  KIDS = list || [];
+  $('#kid').innerHTML = KIDS.map(k => `<option>${esc(k.name)}</option>`).join('');
+  if (KIDS.some(k => k.name === cur)) $('#kid').value = cur;
+  $('#kidCard').hidden = KIDS.length < 2;
+}
+
 function render() {
   const k = kidNow();
   if (!k) return;
+  const keep = picked();   // 重新畫的時候，已經勾的保留
   const todo = k.classes.filter(c => !c.on), done = k.classes.filter(c => c.on);
   $('#opts').innerHTML = todo.length
     ? todo.map(c => {
         const sp = c.label.indexOf(' ');
-        return `<label class="opt"><input type="checkbox" value="${esc(c.id)}"><span><span class="d">${esc(c.label.slice(0, sp))}</span> <span class="c">${esc(c.label.slice(sp + 1))}</span></span></label>`;
+        return `<label class="opt"><input type="checkbox" value="${esc(c.id)}"${keep.indexOf(c.id) >= 0 ? ' checked' : ''}><span><span class="d">${esc(c.label.slice(0, sp))}</span> <span class="c">${esc(c.label.slice(sp + 1))}</span></span></label>`;
       }).join('')
     : done.length ? '<div class="empty">接下來 3 週的課都已經請好假了 ✅</div>'
     : `<div class="empty">接下來 3 週沒有可以請假的課 🙂<br>如果需要請假，請直接傳訊息給主任。</div>`;
   $('#done').innerHTML = done.length
-    ? done.map(c => `<div class="row"><div class="t">✅ ${esc(c.label)}</div><button class="cancel" data-id="${esc(c.id)}">取消</button></div>`).join('')
+    ? done.map(c => `<div class="row"><div class="t">✅ ${esc(c.label)}</div><button class="cancel" data-id="${esc(c.id)}"${fresh ? '' : ' disabled'}>取消</button></div>`).join('')
     : '<div class="empty">目前沒有</div>';
   document.querySelectorAll('#opts input').forEach(i => i.onchange = refreshBtn);
   document.querySelectorAll('#done .cancel').forEach(b => b.onclick = () => cancel(b));
+  $('#stale').hidden = fresh;
   refreshBtn();
 }
 
@@ -131,8 +154,8 @@ function picked() { return [...document.querySelectorAll('#opts input:checked')]
 function refreshBtn() {
   const n = picked().length, b = $('#submit');
   $('#reasonCard').hidden = !n;
-  b.disabled = !n || busy;
-  if (!busy) b.textContent = n ? `送出請假（${n} 堂）` : '請先勾選要請假的課';
+  b.disabled = !n || busy || !fresh;
+  if (!busy) b.textContent = !fresh ? '更新中…' : n ? `送出請假（${n} 堂）` : '請先勾選要請假的課';
 }
 
 // 在聊天室留一則紀錄（以家長的名義送出，不扣官方帳號的訊息額度；不在 LINE 裡開就略過）
@@ -142,20 +165,20 @@ async function chatLog(r) {
 }
 
 function apply(r) {
-  if (r.kids) { KIDS = r.kids; render(); }
+  if (r.kids) { setKids(r.kids); cacheSet(myUid(), r.kids); render(); }
   if (r.msg) showMsg(r.msg, r.ok);
 }
 
 async function submit() {
   const ids = picked();
-  if (!ids.length || busy) return;
+  if (!ids.length || busy || !fresh) return;
   busy = true; $('#submit').disabled = true; $('#submit').textContent = '送出中…';
   try {
     const r = await api('submit', { kid: kidNow().name, ids, reason: $('#reason').value });
     busy = false;
-    if (r.ok) $('#reason').value = '';
-    await chatLog(r);
-    apply(r);
+    if (r.ok) { $('#reason').value = ''; document.querySelectorAll('#opts input').forEach(i => { i.checked = false; }); }
+    apply(r);       // 先把結果顯示出來
+    chatLog(r);     // 聊天室紀錄在背景送，不用等
   } catch (e) {
     busy = false;
     showMsg('網路不穩，送出失敗，請再試一次 🙏', false);
@@ -164,7 +187,7 @@ async function submit() {
 }
 
 async function cancel(b) {
-  if (busy) return;
+  if (busy || !fresh) return;
   if (!b.classList.contains('sure')) {   // 第一次按：變成「確定取消？」，3 秒內再按一次才取消
     b.classList.add('sure'); b.textContent = '確定取消？';
     setTimeout(() => { if (b.isConnected && !busy) { b.classList.remove('sure'); b.textContent = '取消'; } }, 3000);
@@ -174,8 +197,8 @@ async function cancel(b) {
   try {
     const r = await api('cancel', { kid: kidNow().name, id: b.dataset.id });
     busy = false;
-    await chatLog(r);
     apply(r);
+    chatLog(r);
   } catch (e) {
     busy = false;
     showMsg('網路不穩，取消失敗，請再試一次 🙏', false);
@@ -183,22 +206,37 @@ async function cancel(b) {
   }
 }
 
+function showApp() {
+  $('#loading').hidden = true;
+  $('#app').hidden = false;
+}
+
 (async function start() {
+  $('#kid').onchange = () => { showMsg(''); render(); };
+  $('#submit').onclick = submit;
+  // 有上次的資料：馬上先顯示（還不能送出，等更新完）
+  const old = cacheGet();
+  if (old && Array.isArray(old.kids) && old.kids.length) { setKids(old.kids); showApp(); render(); }
   try {
     await liff.init({ liffId: LIFF_ID });
     if (!liff.isLoggedIn()) { liff.login({ redirectUri: location.href }); return; }
+    const uid = myUid();
+    if (old && old.uid && uid && old.uid !== uid) {   // 換了 LINE 帳號：上次的資料不是這個人的，先收起來
+      cacheDrop(); KIDS = []; $('#app').hidden = true; $('#loading').hidden = false;
+    }
     const r = await api('init');
-    $('#loading').hidden = true;
-    if (!r.ok) { showMsg(r.msg, false); return; }
-    KIDS = r.kids;
-    $('#kid').innerHTML = KIDS.map(k => `<option>${esc(k.name)}</option>`).join('');
-    $('#kidCard').hidden = KIDS.length < 2;
-    $('#kid').onchange = () => { showMsg(''); render(); };
-    $('#submit').onclick = submit;
-    $('#app').hidden = false;
+    if (!r.ok) {
+      $('#loading').hidden = true; $('#app').hidden = true; cacheDrop();
+      showMsg(r.msg, false); return;
+    }
+    fresh = true;
+    setKids(r.kids);
+    cacheSet(uid, r.kids);
+    showApp();
     render();
   } catch (e) {
     $('#loading').hidden = true;
+    if (!fresh) { $('#app').hidden = true; }
     showMsg('頁面開不起來 🙏 請關掉後重新按選單的「請假」；還是不行請直接傳訊息給主任。', false);
     console.error(e);
   }
